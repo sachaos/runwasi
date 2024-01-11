@@ -1,17 +1,23 @@
 use std::fs::File;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use hyper::http;
 use containerd_shim_wasm::container::{
     Engine, Entrypoint, Instance, RuntimeContext, Stdio, WasmBinaryType,
 };
 use wasi_common::I32Exit;
 use wasmtime::component::{self as wasmtime_component, Component, InstancePre};
-use wasmtime::{Module, Store};
-use wasmtime_wasi::preview2::{self as wasi_preview2, Table};
-use wasmtime_wasi::{self as wasi_preview1, Dir};
+use wasmtime::{Module, Store, StoreLimits};
+use wasmtime_wasi::preview2::{self as wasi_preview2, Table, WasiCtx, WasiView};
+use wasmtime_wasi::{self as wasi_preview1, Dir, WasiCtxBuilder};
 use wasmtime_wasi_http::io::TokioIo;
+use wasmtime_wasi_http::{
+    bindings::http::types as http_types, body::HyperOutgoingBody, hyper_response_error,
+    WasiHttpCtx, WasiHttpView,
+};
 
 pub type WasmtimeInstance = Instance<WasmtimeEngine>;
 
@@ -29,32 +35,6 @@ impl Default for WasmtimeEngine {
                 .context("failed to create wasmtime engine")
                 .unwrap(),
         }
-    }
-}
-
-/// Data that contains both wasi_preview1 and wasi_preview2 contexts.
-pub struct WasiCtx {
-    pub(crate) wasi_preview2: wasi_preview2::WasiCtx,
-    pub(crate) wasi_preview1: wasi_preview1::WasiCtx,
-    pub(crate) wasi_preview2_table: Table,
-}
-
-/// This impl is required to use wasmtime_wasi::preview2::WasiView trait.
-impl wasmtime_wasi::preview2::WasiView for WasiCtx {
-    fn table(&self) -> &Table {
-        &self.wasi_preview2_table
-    }
-
-    fn table_mut(&mut self) -> &mut Table {
-        &mut self.wasi_preview2_table
-    }
-
-    fn ctx(&self) -> &wasi_preview2::WasiCtx {
-        &self.wasi_preview2
-    }
-
-    fn ctx_mut(&mut self) -> &mut wasi_preview2::WasiCtx {
-        &mut self.wasi_preview2
     }
 }
 
@@ -78,11 +58,10 @@ impl Engine for WasmtimeEngine {
         let wasm_binary = source.into_wasm_binary()?;
 
         log::info!("building wasi context");
-        let wasi_ctx = prepare_wasi_ctx(ctx, envs)?;
 
         let status = match WasmBinaryType::from_bytes(&wasm_binary) {
-            Some(WasmBinaryType::Module) => self.execute_module(&wasm_binary, &func, wasi_ctx)?,
-            Some(WasmBinaryType::Component) => self.execute_component(wasm_binary, func, wasi_ctx)?,
+            Some(WasmBinaryType::Module) => bail!("module not supported"),
+            Some(WasmBinaryType::Component) => self.execute_component_serve(ctx, wasm_binary, func, envs)?,
             None => bail!("not a valid wasm binary format"),
         };
 
@@ -102,42 +81,12 @@ impl Engine for WasmtimeEngine {
 }
 
 impl WasmtimeEngine {
-    /// Execute a wasm module.
-    ///
-    /// This function adds wasi_preview1 to the linker and can be utilized
-    /// to execute a wasm module that uses wasi_preview1.
-    fn execute_module(
-        &self,
-        wasm_binary: &[u8],
-        func: &String,
-        wasi_ctx: WasiCtx,
-    ) -> Result<std::prelude::v1::Result<(), anyhow::Error>, anyhow::Error> {
-        let store = Store::new(&self.engine, wasi_ctx);
-
-        log::debug!("loading wasm module");
-        let module = Module::from_binary(&self.engine, wasm_binary)?;
-        let mut module_linker = wasmtime::Linker::new(&self.engine);
-
-        wasi_preview1::add_to_linker(&mut module_linker, |s: &mut WasiCtx| &mut s.wasi_preview1)?;
-
-        log::info!("instantiating instance");
-        let instance: wasmtime::Instance = module_linker.instantiate(&mut store, &module)?;
-
-        log::info!("getting start function");
-        let start_func = instance
-            .get_func(&mut store, func)
-            .context("module does not have a WASI start function")?;
-
-        log::debug!("running start function {func:?}");
-        let status = start_func.call(&mut store, &[], &mut []);
-        Ok(status)
-    }
-
     fn execute_component_serve(
         &self,
+        ctx: &impl RuntimeContext,
         wasm_binary: Vec<u8>,
         func: String,
-        wasi_ctx: WasiCtx,
+        envs: Vec<(String, String)>
     ) -> Result<std::prelude::v1::Result<(), anyhow::Error>, anyhow::Error> {
         log::debug!("loading wasm component");
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -145,13 +94,16 @@ impl WasmtimeEngine {
             .enable_io()
             .build()?;
 
+        let args = ctx.args().to_vec();
+
+        let engine = self.engine.clone();
         runtime.block_on(async move {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
                     Ok::<_, anyhow::Error>(())
                 }
 
-                res = self.serve(wasm_binary, wasi_ctx) => {
+                res = serve(engine, wasm_binary, args, envs) => {
                     res
                 }
             }
@@ -160,118 +112,206 @@ impl WasmtimeEngine {
         Ok(Ok(()))
     }
 
-    async fn serve(mut self, wasm_binary: Vec<u8>, wasi_ctx: WasiCtx) -> Result<()> {
-        let component = Component::from_binary(&self.engine, &wasm_binary)?;
-        let mut linker = wasmtime_component::Linker::new(&self.engine);
+}
 
-        wasi_preview2::command::add_to_linker(&mut linker)?;
-        wasmtime_wasi_http::proxy::add_only_http_to_linker(&mut linker)?;
+async fn serve(engine: wasmtime::Engine, wasm_binary: Vec<u8>, args: Vec<String>, envs: Vec<(String, String)>) -> Result<()> {
+    let component = Component::from_binary(&engine, &wasm_binary)?;
+    let mut linker = wasmtime_component::Linker::new(&engine);
 
-        let instance = linker.instantiate_pre(&component)?;
+    wasi_preview2::command::add_to_linker(&mut linker)?;
+    wasmtime_wasi_http::proxy::add_only_http_to_linker(&mut linker)?;
 
-        use hyper::server::conn::http1;
+    let instance = linker.instantiate_pre(&component)?;
 
-        const DEFAULT_ADDR: std::net::SocketAddr = std::net::SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
-            8080,
-        );
+    use hyper::server::conn::http1;
 
-        let listener = tokio::net::TcpListener::bind(DEFAULT_ADDR).await?;
+    const DEFAULT_ADDR: std::net::SocketAddr = std::net::SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
+        8080,
+    );
 
-        eprintln!("Serving HTTP on http://{}/", listener.local_addr()?);
+    let listener = tokio::net::TcpListener::bind(DEFAULT_ADDR).await?;
 
-        log::info!("Listening on {}", DEFAULT_ADDR);
+    eprintln!("Serving HTTP on http://{}/", listener.local_addr()?);
 
-        let handler = wasmtime::ProxyHandler::new(|engine, req_id| {
-            let store = Store::new(&engine, wasi_ctx.clone());
-            store
-        }, engine, instance);
+    log::info!("Listening on {}", DEFAULT_ADDR);
 
-        loop {
-            let (stream, _) = listener.accept().await?;
-            let stream = TokioIo::new(stream);
-            let h = handler.clone();
-            tokio::task::spawn(async move {
-                if let Err(e) = http1::Builder::new()
-                    .keep_alive(true)
-                    .serve_connection(stream, h)
-                    .await
-                {
-                    eprintln!("error: {e:?}");
-                }
-            });
-        }
-    }
+    let handler = ProxyHandler::new(engine, instance, args, envs);
 
-    /// Execute a wasm component.
-    ///
-    /// This function adds wasi_preview2 to the linker and can be utilized
-    /// to execute a wasm component that uses wasi_preview2.
-    fn execute_component(
-        &self,
-        wasm_binary: Vec<u8>,
-        func: String,
-        wasi_ctx: WasiCtx,
-    ) -> Result<std::prelude::v1::Result<(), anyhow::Error>, anyhow::Error> {
-        let store = Store::new(&self.engine, wasi_ctx);
-
-        log::debug!("loading wasm component");
-        let component = Component::from_binary(&self.engine, &wasm_binary)?;
-        let mut linker = wasmtime_component::Linker::new(&self.engine);
-
-        wasi_preview2::command::sync::add_to_linker(&mut linker)?;
-
-        log::info!("instantiating component");
-
-        // This is a adapter logic that converts wasip1 `_start` function to wasip2 `run` function.
-        //
-        // TODO: think about a better way to do this.
-        if func == "_start" {
-            let (command, _instance) = wasi_preview2::command::sync::Command::instantiate(
-                &mut store, &component, &linker,
-            )?;
-
-            let status = command.wasi_cli_run().call_run(&mut store)?.map_err(|_| {
-                anyhow::anyhow!("failed to run component targeting `wasi:cli/command` world")
-            });
-            Ok(status)
-        } else {
-            let instance = linker.instantiate(&mut store, &component)?;
-
-            log::info!("getting component exported function {func:?}");
-            let start_func = instance.get_func(&mut store, &func).context(format!(
-                "component does not have exported function {func:?}"
-            ))?;
-
-            log::debug!("running exported function {func:?} {start_func:?}");
-            let status = start_func.call(&mut store, &[], &mut []);
-            Ok(status)
-        }
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let stream = TokioIo::new(stream);
+        let h = handler.clone();
+        tokio::task::spawn(async move {
+            if let Err(e) = http1::Builder::new()
+                .keep_alive(true)
+                .serve_connection(stream, h)
+                .await
+            {
+                eprintln!("error: {e:?}");
+            }
+        });
     }
 }
 
-/// Prepare both wasi_preview1 and wasi_preview2 contexts.
-fn prepare_wasi_ctx(
-    ctx: &impl RuntimeContext,
-    envs: Vec<(String, String)>,
-) -> Result<WasiCtx, anyhow::Error> {
-    let mut wasi_preview1_builder = wasi_preview1::WasiCtxBuilder::new();
-    wasi_preview1_builder
-        .args(ctx.args())?
-        .envs(envs.as_slice())?
-        .inherit_stdio()
-        .preopened_dir(Dir::from_std_file(File::open("/")?), "/")?;
-    let wasi_preview1_ctx = wasi_preview1_builder.build();
+struct Host {
+    table: Table,
+    ctx: WasiCtx,
+    http: WasiHttpCtx,
 
-    // TODO: make this more configurable (e.g. allow the user to specify the
-    // preopened directories and their permissions)
-    // https://github.com/containerd/runwasi/issues/413
+    limits: StoreLimits,
+}
+
+impl WasiView for Host {
+    fn table(&self) -> &Table {
+        &self.table
+    }
+
+    fn table_mut(&mut self) -> &mut Table {
+        &mut self.table
+    }
+
+    fn ctx(&self) -> &WasiCtx {
+        &self.ctx
+    }
+
+    fn ctx_mut(&mut self) -> &mut WasiCtx {
+        &mut self.ctx
+    }
+}
+
+impl WasiHttpView for Host {
+    fn table(&mut self) -> &mut Table {
+        &mut self.table
+    }
+
+    fn ctx(&mut self) -> &mut WasiHttpCtx {
+        &mut self.http
+    }
+}
+
+struct ProxyHandlerInner {
+    engine: wasmtime::Engine,
+    args: Vec<String>,
+    instance_pre: InstancePre<Host>,
+    next_id: AtomicU64,
+    envs: Vec<(String, String)>,
+}
+
+impl ProxyHandlerInner {
+    fn next_req_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+#[derive(Clone)]
+struct ProxyHandler(Arc<ProxyHandlerInner>);
+
+impl ProxyHandler {
+    fn new(engine: wasmtime::Engine, instance_pre: InstancePre<Host>, args: Vec<String>, envs: Vec<(String, String)>) -> Self {
+        Self(Arc::new(ProxyHandlerInner {
+            engine,
+            instance_pre,
+            args,
+            envs,
+            next_id: AtomicU64::from(0),
+        }))
+    }
+}
+
+type Request = hyper::Request<hyper::body::Incoming>;
+
+impl hyper::service::Service<Request> for ProxyHandler {
+    type Response = hyper::Response<HyperOutgoingBody>;
+    type Error = anyhow::Error;
+    type Future = Pin<Box<dyn std::future::Future<Output = Result<Self::Response>> + Send>>;
+
+    fn call(&self, req: Request) -> Self::Future {
+        use http_body_util::BodyExt;
+
+        let ProxyHandler(inner) = self.clone();
+
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+
+        // TODO: need to track the join handle, but don't want to block the response on it
+        tokio::task::spawn(async move {
+            let req_id = inner.next_req_id();
+            let (mut parts, body) = req.into_parts();
+
+            parts.uri = {
+                let uri_parts = parts.uri.into_parts();
+
+                let scheme = uri_parts.scheme.unwrap_or(http::uri::Scheme::HTTP);
+
+                let host = if let Some(val) = parts.headers.get(hyper::header::HOST) {
+                    std::str::from_utf8(val.as_bytes())
+                        .map_err(|_| http_types::ErrorCode::HttpRequestUriInvalid)?
+                } else {
+                    uri_parts
+                        .authority
+                        .as_ref()
+                        .ok_or(http_types::ErrorCode::HttpRequestUriInvalid)?
+                        .host()
+                };
+
+                let path_with_query = uri_parts
+                    .path_and_query
+                    .ok_or(http_types::ErrorCode::HttpRequestUriInvalid)?;
+
+                hyper::Uri::builder()
+                    .scheme(scheme)
+                    .authority(host)
+                    .path_and_query(path_with_query)
+                    .build()
+                    .map_err(|_| http_types::ErrorCode::HttpRequestUriInvalid)?
+            };
+
+            let req = hyper::Request::from_parts(parts, body.map_err(hyper_response_error).boxed());
+
+            log::info!(
+                "Request {req_id} handling {} to {}",
+                req.method(),
+                req.uri()
+            );
+
+            let mut store = new_store(&inner.engine, req_id, inner.args.clone(), inner.envs.clone())?;
+
+            let req = store.data_mut().new_incoming_request(req)?;
+            let out = store.data_mut().new_response_outparam(sender)?;
+
+            let (proxy, _inst) =
+                wasmtime_wasi_http::proxy::Proxy::instantiate_pre(&mut store, &inner.instance_pre)
+                    .await?;
+
+            if let Err(e) = proxy
+                .wasi_http_incoming_handler()
+                .call_handle(store, req, out)
+                .await
+            {
+                log::error!("[{req_id}] :: {:#?}", e);
+                return Err(e);
+            }
+
+            Ok(())
+        });
+
+        Box::pin(async move {
+            match receiver.await {
+                Ok(Ok(resp)) => Ok(resp),
+                Ok(Err(e)) => Err(e.into()),
+                Err(_) => bail!("guest never invoked `response-outparam::set` method"),
+            }
+        })
+    }
+}
+
+fn new_store(engine: &wasmtime::Engine, req_id: u64, args: Vec<String>, envs: Vec<(String, String)>) -> Result<Store<Host>> {
     let file_perms = wasi_preview2::FilePerms::all();
     let dir_perms = wasi_preview2::DirPerms::all();
 
     let mut wasi_preview2_builder = wasi_preview2::WasiCtxBuilder::new();
     wasi_preview2_builder
-        .args(ctx.args())
+        .args(args.as_slice())
         .envs(envs.as_slice())
         .inherit_stdio()
         .preopened_dir(
@@ -281,10 +321,18 @@ fn prepare_wasi_ctx(
             "/",
         );
     let wasi_preview2_ctx = wasi_preview2_builder.build();
-    let wasi_data = WasiCtx {
-        wasi_preview1: wasi_preview1_ctx,
-        wasi_preview2: wasi_preview2_ctx,
-        wasi_preview2_table: wasi_preview2::Table::new(),
+
+    let mut host = Host {
+        table: Table::new(),
+        ctx: wasi_preview2_ctx,
+        http: WasiHttpCtx,
+
+        limits: StoreLimits::default(),
     };
-    Ok(wasi_data)
+
+    let mut store = Store::new(engine, host);
+
+    store.limiter(|t| &mut t.limits);
+
+    Ok(store)
 }

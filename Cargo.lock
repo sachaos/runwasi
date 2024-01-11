@@ -709,14 +709,20 @@ name = "containerd-shim-wasmtimeserve"
 version = "0.3.1"
 dependencies = [
  "anyhow",
+ "bytes",
  "containerd-shim",
  "containerd-shim-wasm",
+ "http-body 1.0.0",
+ "http-body-util",
+ "hyper 1.1.0",
  "log",
  "oci-spec",
  "serial_test",
+ "tokio",
  "ttrpc",
  "wasi-common",
  "wasmtime",
+ "wasmtime-runtime",
  "wasmtime-wasi",
  "wasmtime-wasi-http",
 ]
