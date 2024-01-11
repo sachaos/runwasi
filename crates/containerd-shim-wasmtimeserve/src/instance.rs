@@ -1,14 +1,17 @@
 use std::fs::File;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use hyper::http;
 use containerd_shim_wasm::container::{
     Engine, Entrypoint, Instance, RuntimeContext, Stdio, WasmBinaryType,
 };
 use wasi_common::I32Exit;
-use wasmtime::component::{self as wasmtime_component, Component};
+use wasmtime::component::{self as wasmtime_component, Component, InstancePre};
 use wasmtime::{Module, Store};
 use wasmtime_wasi::preview2::{self as wasi_preview2, Table};
 use wasmtime_wasi::{self as wasi_preview1, Dir};
+use wasmtime_wasi_http::io::TokioIo;
 
 pub type WasmtimeInstance = Instance<WasmtimeEngine>;
 
@@ -76,11 +79,10 @@ impl Engine for WasmtimeEngine {
 
         log::info!("building wasi context");
         let wasi_ctx = prepare_wasi_ctx(ctx, envs)?;
-        let store = Store::new(&self.engine, wasi_ctx);
 
         let status = match WasmBinaryType::from_bytes(&wasm_binary) {
-            Some(WasmBinaryType::Module) => self.execute_module(&wasm_binary, store, &func)?,
-            Some(WasmBinaryType::Component) => self.execute_component(wasm_binary, store, func)?,
+            Some(WasmBinaryType::Module) => self.execute_module(&wasm_binary, &func, wasi_ctx)?,
+            Some(WasmBinaryType::Component) => self.execute_component(wasm_binary, func, wasi_ctx)?,
             None => bail!("not a valid wasm binary format"),
         };
 
@@ -107,9 +109,11 @@ impl WasmtimeEngine {
     fn execute_module(
         &self,
         wasm_binary: &[u8],
-        mut store: Store<WasiCtx>,
         func: &String,
+        wasi_ctx: WasiCtx,
     ) -> Result<std::prelude::v1::Result<(), anyhow::Error>, anyhow::Error> {
+        let store = Store::new(&self.engine, wasi_ctx);
+
         log::debug!("loading wasm module");
         let module = Module::from_binary(&self.engine, wasm_binary)?;
         let mut module_linker = wasmtime::Linker::new(&self.engine);
@@ -132,10 +136,31 @@ impl WasmtimeEngine {
     fn execute_component_serve(
         &self,
         wasm_binary: Vec<u8>,
-        mut store: Store<WasiCtx>,
         func: String,
+        wasi_ctx: WasiCtx,
     ) -> Result<std::prelude::v1::Result<(), anyhow::Error>, anyhow::Error> {
         log::debug!("loading wasm component");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_time()
+            .enable_io()
+            .build()?;
+
+        runtime.block_on(async move {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    Ok::<_, anyhow::Error>(())
+                }
+
+                res = self.serve(wasm_binary, wasi_ctx) => {
+                    res
+                }
+            }
+        })?;
+
+        Ok(Ok(()))
+    }
+
+    async fn serve(mut self, wasm_binary: Vec<u8>, wasi_ctx: WasiCtx) -> Result<()> {
         let component = Component::from_binary(&self.engine, &wasm_binary)?;
         let mut linker = wasmtime_component::Linker::new(&self.engine);
 
@@ -144,33 +169,37 @@ impl WasmtimeEngine {
 
         let instance = linker.instantiate_pre(&component)?;
 
-        wasi_preview2::command::sync::add_to_linker(&mut linker)?;
+        use hyper::server::conn::http1;
 
-        log::info!("instantiating component");
+        const DEFAULT_ADDR: std::net::SocketAddr = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
+            8080,
+        );
 
-        // This is a adapter logic that converts wasip1 `_start` function to wasip2 `run` function.
-        //
-        // TODO: think about a better way to do this.
-        if func == "_start" {
-            let (command, _instance) = wasi_preview2::command::sync::Command::instantiate(
-                &mut store, &component, &linker,
-            )?;
+        let listener = tokio::net::TcpListener::bind(DEFAULT_ADDR).await?;
 
-            let status = command.wasi_cli_run().call_run(&mut store)?.map_err(|_| {
-                anyhow::anyhow!("failed to run component targeting `wasi:cli/command` world")
+        eprintln!("Serving HTTP on http://{}/", listener.local_addr()?);
+
+        log::info!("Listening on {}", DEFAULT_ADDR);
+
+        let handler = wasmtime::ProxyHandler::new(|engine, req_id| {
+            let store = Store::new(&engine, wasi_ctx.clone());
+            store
+        }, engine, instance);
+
+        loop {
+            let (stream, _) = listener.accept().await?;
+            let stream = TokioIo::new(stream);
+            let h = handler.clone();
+            tokio::task::spawn(async move {
+                if let Err(e) = http1::Builder::new()
+                    .keep_alive(true)
+                    .serve_connection(stream, h)
+                    .await
+                {
+                    eprintln!("error: {e:?}");
+                }
             });
-            Ok(status)
-        } else {
-            let instance = linker.instantiate(&mut store, &component)?;
-
-            log::info!("getting component exported function {func:?}");
-            let start_func = instance.get_func(&mut store, &func).context(format!(
-                "component does not have exported function {func:?}"
-            ))?;
-
-            log::debug!("running exported function {func:?} {start_func:?}");
-            let status = start_func.call(&mut store, &[], &mut []);
-            Ok(status)
         }
     }
 
@@ -181,9 +210,11 @@ impl WasmtimeEngine {
     fn execute_component(
         &self,
         wasm_binary: Vec<u8>,
-        mut store: Store<WasiCtx>,
         func: String,
+        wasi_ctx: WasiCtx,
     ) -> Result<std::prelude::v1::Result<(), anyhow::Error>, anyhow::Error> {
+        let store = Store::new(&self.engine, wasi_ctx);
+
         log::debug!("loading wasm component");
         let component = Component::from_binary(&self.engine, &wasm_binary)?;
         let mut linker = wasmtime_component::Linker::new(&self.engine);
