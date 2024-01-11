@@ -6,6 +6,7 @@ members = [
     "crates/oci-tar-builder",
     "crates/containerd-shim-wasmedge",
     "crates/containerd-shim-wasmtime",
+    "crates/containerd-shim-wasmtimeserve",
     "crates/containerd-shim-wasmer"
 ]
 resolver = "2"
